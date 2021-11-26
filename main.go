@@ -3,247 +3,199 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
-	"net"
-	"os/exec"
-	"regexp"
-	"strings"
-	"time"
+	"os"
+	"os/signal"
+	"runtime"
+	"syscall"
+
+	"go.uber.org/multierr"
 )
 
-var re = regexp.MustCompile(`(\/dev\/pts\/\d+)`)
+const (
+	DEFAULT_SAMPLE_RATE = 10 * MHz
+	DEFAULT_FREQ_HZ     = 3425 * MHz
+	DEFAULT_TXVGA_GAIN  = 10
+	DEFAULT_VGA_GAIN    = 20
+	DEFAULT_LNA_GAIN    = 8
+)
 
 func main() {
-	var direwolfTxStdout io.ReadCloser
-	var direwolfTxStdin io.WriteCloser
-	{
-		var err error
-		cmdDirewolfTx := exec.Command("/usr/local/bin/direwolf", strings.Split(`-t 0 -p -B 300 -c /home/spook/direwolf-tx.conf`, " ")...)
-		direwolfTxStdout, err = cmdDirewolfTx.StdoutPipe()
-		if err != nil {
-			panic(err)
-		}
-		defer direwolfTxStdout.Close()
+	// q := NewPacketModem(payloadLen, crcCheck, fec0, fec1, modScheme)
+	// defer q.Close()
 
-		direwolfTxStdin, err = cmdDirewolfTx.StdinPipe()
-		if err != nil {
-			panic(err)
-		}
-		defer direwolfTxStdin.Close()
-
-		direwolfStderr, err := cmdDirewolfTx.StderrPipe()
-		if err != nil {
-			panic(err)
-		}
-		defer direwolfStderr.Close()
-		go pipeOutputToTerminal("direwolf-tx", direwolfStderr)
-
-		err = cmdDirewolfTx.Start()
-		if err != nil {
-			panic(err)
-		}
-	}
-	defer direwolfTxStdin.Close()
-
-	var direwolfRxStdout io.ReadCloser
-	var direwolfRxStdin io.WriteCloser
-	{
-		var err error
-		cmdDirewolfRx := exec.Command("/usr/local/bin/direwolf", strings.Split(`-t 0 -p -B 300 -c /home/spook/direwolf-rx.conf`, " ")...)
-		direwolfRxStdout, err = cmdDirewolfRx.StdoutPipe()
-		if err != nil {
-			panic(err)
-		}
-		defer direwolfRxStdout.Close()
-
-		direwolfRxStdin, err = cmdDirewolfRx.StdinPipe()
-		if err != nil {
-			panic(err)
-		}
-		defer direwolfRxStdin.Close()
-
-		direwolfStderr, err := cmdDirewolfRx.StderrPipe()
-		if err != nil {
-			panic(err)
-		}
-		defer direwolfStderr.Close()
-		go pipeOutputToTerminal("direwolf-rx", direwolfStderr)
-
-		err = cmdDirewolfRx.Start()
-		if err != nil {
-			panic(err)
-		}
-	}
-	defer direwolfRxStdin.Close()
-
-	time.Sleep(1 * time.Second)
-
-	connTx, err := net.Dial("tcp", "127.0.0.1:8001")
-	if err != nil {
-		panic(err)
-	}
-	defer connTx.Close()
-
-	connRx, err := net.Dial("tcp", "127.0.0.1:9001")
-	if err != nil {
-		panic(err)
-	}
-	defer connRx.Close()
-
-	time.Sleep(1 * time.Second)
-
-	go func() {
-		for {
-			transmit(direwolfTxStdout, connTx, fmt.Sprintf("howdy %v", time.Now()))
-			time.Sleep(3 * time.Second)
-		}
-	}()
-
-	// go receive(direwolfTxStdin, direwolfTxStdout, conn)
-	{
-
-	}
-
-	select {}
-}
-
-func direwolfTx() (stdin io.WriteCloser, stdout io.ReadCloser) {
+	var radio *HackRF
+	var modem *FlexFrameModem
 	var err error
-	cmd := exec.Command("/usr/local/bin/direwolf", strings.Split(`-t 0 -p -B 300 -c /home/spook/direwolf-tx.conf`, " ")...)
-	stdout, err = cmd.StdoutPipe()
+
+	radio, err = NewHackRF(DEFAULT_SAMPLE_RATE, DEFAULT_FREQ_HZ, DEFAULT_FREQ_HZ, DEFAULT_TXVGA_GAIN, DEFAULT_VGA_GAIN, DEFAULT_LNA_GAIN, func(bs []byte) {
+		modem.DecodeFrames(iqSamplesToComplex64s(bs))
+	})
+	if err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+
+	modem = NewFlexFrameModem(
+		func(c64s []complex64) {
+			radio.Transmit(complex64sToIQSamples(c64s))
+		},
+		func(bs []byte) {
+			fmt.Println("RECV:", string(bs))
+		},
+	)
+
+	err = radio.Start()
 	if err != nil {
 		panic(err)
 	}
-	defer stdout.Close()
+	defer radio.Close()
 
-	stdin, err = cmd.StdinPipe()
+	err = modem.Start()
 	if err != nil {
 		panic(err)
 	}
-	defer stdin.Close()
+	defer modem.Close()
 
-	direwolfStderr, err := cmd.StderrPipe()
-	if err != nil {
-		panic(err)
-	}
-	defer direwolfStderr.Close()
-	go pipeOutputToTerminal("direwolf-tx", direwolfStderr)
-
-	err = cmd.Start()
-	if err != nil {
-		panic(err)
-	}
-	return stdin, stdout
-}
-
-func direwolfRx() (stdin io.WriteCloser, stdout io.ReadCloser) {
-	var err error
-	cmd := exec.Command("/usr/local/bin/direwolf", strings.Split(`-t 0 -p -B 300 -c /home/spook/direwolf-rx.conf`, " ")...)
-	stdout, err = cmd.StdoutPipe()
-	if err != nil {
-		panic(err)
-	}
-	defer stdout.Close()
-
-	stdin, err = cmd.StdinPipe()
-	if err != nil {
-		panic(err)
-	}
-	defer stdin.Close()
-
-	direwolfStderr, err := cmd.StderrPipe()
-	if err != nil {
-		panic(err)
-	}
-	defer direwolfStderr.Close()
-	go pipeOutputToTerminal("direwolf-rx", direwolfStderr)
-
-	err = cmd.Start()
-	if err != nil {
-		panic(err)
-	}
-	return stdin, stdout
-}
-
-func transmit(direwolfTxStdout io.Reader, conn net.Conn, msg string) {
-	cmdHackRF := exec.Command("hackrf_transfer", strings.Split(`-S 100 -p 1 -a 1 -t -`, " ")...)
-	go pipeStderrToTerminal("hackrf", cmdHackRF)
-
-	hackRFStdin, err := cmdHackRF.StdinPipe()
-	if err != nil {
-		panic(err)
-	}
-	defer hackRFStdin.Close()
-
+	chSignal := make(chan os.Signal, 1)
+	signal.Notify(chSignal, syscall.SIGINT, syscall.SIGILL, syscall.SIGFPE, syscall.SIGSEGV, syscall.SIGTERM, syscall.SIGABRT)
 	go func() {
-		_, err := io.Copy(hackRFStdin, direwolfTxStdout)
-		if err != nil {
-			time.Sleep(1 * time.Second)
-			panic(err)
+		runtime.LockOSThread()
+		select {
+		case <-chSignal:
+			err := multierr.Combine(
+				modem.Close(),
+				radio.Close(),
+				os.Stdin.Close(),
+			)
+			if err != nil {
+				fmt.Println(err)
+			}
 		}
 	}()
 
-	err = cmdHackRF.Run()
-	if err != nil {
-		panic(err)
-	}
-
-	bs := append([]byte{0xC0, 0x00}, []byte(msg)...)
-	bs = append(bs, 0xC0)
-
-	n, err := conn.Write(bs)
-	if err != nil {
-		panic(err)
-	} else if n < 7 {
-		panic("yeet")
-	}
-}
-
-func receive(direwolfRxStdin io.Writer, conn net.Conn) {
-	cmdHackRF := exec.Command("hackrf_transfer", strings.Split(`-S 1200 -p 1 -a 1 -r -`, " ")...)
-	go pipeStderrToTerminal("hackrf", cmdHackRF)
-
-	hackRFStdout, err := cmdHackRF.StdoutPipe()
-	if err != nil {
-		panic(err)
-	}
-
-	go func() {
-		_, err := io.Copy(direwolfRxStdin, hackRFStdout)
-		if err != nil {
-			panic(err)
-		}
-	}()
-
-	err = cmdHackRF.Run()
-	if err != nil {
-		panic(err)
-	}
-
+	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		bs := make([]byte, 1024)
-		n, err := conn.Read(bs)
-		if err != nil {
-			panic(err)
-		} else if n < 7 {
-			panic("yeet")
+		fmt.Printf("> ")
+
+		if !scanner.Scan() {
+			break
 		}
-		fmt.Println(string(bs))
+		line := scanner.Text()
+		modem.EncodeFrames([]byte(line))
 	}
 }
 
-func pipeOutputToTerminal(label string, r io.Reader) {
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		fmt.Println(fmt.Sprintf("[%v]"), scanner.Text())
-	}
-}
+// var (
+// 	payloadTx  = []byte(`{"foo": "bar", "baz": 123, "quux": false}`)
+// 	payloadLen = uint32(len(payloadTx))
+// )
 
-func pipeStderrToTerminal(label string, cmd *exec.Cmd) {
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		panic(err)
-	}
-	defer stderr.Close()
-	pipeOutputToTerminal(label, stderr)
-}
+// func tx() {
+// 	q := NewPacketModem(payloadLen, crcCheck, fec0, fec1, modScheme)
+// 	defer q.Close()
+
+// 	must(hackrf.Init())
+// 	defer hackrf.Exit()
+
+// 	device := &hackrf.Device{}
+// 	must(hackrf.Open(&device))
+// 	defer hackrf.Close(device)
+
+// 	must(hackrf.SetSampleRate(device, DEFAULT_SAMPLE_RATE))
+// 	must(hackrf.SetTxvgaGain(device, DEFAULT_TXVGA_GAIN))
+
+// 	frameBytes, err := q.Encode(payloadTx)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	t := transmit{r: bytes.NewReader(frameBytes)}
+// 	must(hackrf.StartTx(device, t.txCallback, nil))
+// 	defer hackrf.StopTx(device)
+
+// 	must(hackrf.SetFreq(device, DEFAULT_FREQ_HZ))
+
+// 	go func() {
+// 		defer t.kill()
+// 		for hackrf.IsStreaming(device) > 0 {
+// 			time.Sleep(10 * time.Millisecond)
+// 		}
+// 	}()
+
+// 	chSignal := make(chan os.Signal, 1)
+// 	signal.Notify(chSignal, syscall.SIGINT, syscall.SIGILL, syscall.SIGFPE, syscall.SIGSEGV, syscall.SIGTERM, syscall.SIGABRT)
+
+// 	select {
+// 	case <-chSignal:
+// 		t.kill()
+// 	case <-t.chStop:
+// 	}
+// }
+
+// func rx() {
+// 	// create and configure packet encoder/decoder object
+// 	q := dsp.QpacketmodemCreate()
+// 	defer dsp.QpacketmodemDestroy(q)
+// 	dsp.QpacketmodemConfigure(q, payloadLen, crcCheck, fec0, fec1, int32(modScheme))
+// 	dsp.QpacketmodemPrint(q)
+
+// 	// get frame length
+// 	frameLen := dsp.QpacketmodemGetFrameLen(q)
+
+// 	must(hackrf.Init())
+// 	defer hackrf.Exit()
+
+// 	device := &hackrf.Device{}
+// 	must(hackrf.Open(&device))
+// 	defer hackrf.Close(device)
+
+// 	must(hackrf.SetSampleRate(device, DEFAULT_SAMPLE_RATE))
+// 	must(hackrf.SetVgaGain(device, DEFAULT_VGA_GAIN))
+// 	must(hackrf.SetLnaGain(device, DEFAULT_LNA_GAIN))
+
+// 	var buf bytes.Buffer
+// 	r := receive{w: &buf}
+// 	must(hackrf.StartRx(device, t.rxCallback, nil))
+// 	defer hackrf.StopRx(device)
+
+// 	must(hackrf.SetFreq(device, DEFAULT_FREQ_HZ))
+
+// 	go func() {
+// 		defer r.kill()
+// 		for hackrf.IsStreaming(device) > 0 {
+// 			time.Sleep(10 * time.Millisecond)
+// 		}
+// 	}()
+
+// 	chSignal := make(chan os.Signal, 1)
+// 	signal.Notify(chSignal, syscall.SIGINT, syscall.SIGILL, syscall.SIGFPE, syscall.SIGSEGV, syscall.SIGTERM, syscall.SIGABRT)
+
+// 	select {
+// 	case <-chSignal:
+// 		r.kill()
+// 	case <-r.chStop:
+// 	}
+
+// 	fmt.Println("received buffer length:", buf.Len())
+// 	c64s := iqSamplesToComplex64s(buf.Bytes())
+
+// 	var (
+// 		payloadLen = uint32(len(payloadTx))
+// 		payloadRx  = make([]byte, payloadLen)
+// 	)
+
+// 	// decode frame
+// 	crcPass := dsp.QpacketmodemDecode(q, c64s, payloadRx) > 0
+
+// 	// count errors
+// 	numBitErrors := dsp.CountBitErrorsArray(payloadTx, payloadRx, payloadLen)
+
+// 	// print results
+// 	if crcPass {
+// 		fmt.Printf("payload PASS, errors: %d / %d\n", numBitErrors, 8*payloadLen)
+// 	} else {
+// 		fmt.Printf("payload FAIL, errors: %d / %d\n", numBitErrors, 8*payloadLen)
+// 	}
+
+// 	fmt.Println("output =", string(payloadRx))
+
+// }
